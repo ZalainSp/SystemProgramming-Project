@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"runtime"
 )
 
 type Message struct {
@@ -25,6 +26,10 @@ var (
 
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
+
+	//10 messages/second max per client
+	rateLimiter := time.NewTicker(100 * time.Millisecond)
+	defer rateLimiter.Stop()
 
 	//ask for and read username
 	fmt.Fprint(conn, "Enter your name: ")
@@ -141,56 +146,119 @@ func handleConnection(conn net.Conn) {
 }
 
 func broadcaster() {
-	for {
-		m := <-broadcast
-		start := time.Now() //start timer for latency
-		mutex.Lock()
-		for conn := range clients {
-			//skip echoing back to the sender when its a user message
-			if m.sender != nil && conn == m.sender {
-				continue
-			}
-			//prefix server messages with [Server] and others with [username]
-			prefix := fmt.Sprintf("[%s] ", m.name)
-			messageText := prefix + m.text
-			fmt.Fprint(conn, messageText)
+    //create a buffered channel for batch processing
+    messageBatch := make(chan []Message, 100)
+    defer close(messageBatch)
 
-			//log message to file named after receiver's IP address
-			clientAddr := conn.RemoteAddr().String()
-			clientIP := strings.Split(clientAddr, ":")[0]
-			filename := fmt.Sprintf("%s.log", clientIP)
+    //start a worker to handle batch sending
+    go func() {
+        for batch := range messageBatch {
+            mutex.Lock()
+            
+            //process all messages in the batch
+            for _, msg := range batch {
+                //log messages (same as before)
+                if msg.sender != nil {
+                    ip := strings.Split(msg.sender.RemoteAddr().String(), ":")[0]
+                    logFile, err := os.OpenFile(ip+".log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+                    if err == nil {
+                        logFile.WriteString(fmt.Sprintf("[%s] %s\n", msg.name, msg.text))
+                        logFile.Close()
+                    }
+                } else {
+                    for client := range clients {
+                        ip := strings.Split(client.RemoteAddr().String(), ":")[0]
+                        logFile, err := os.OpenFile(ip+".log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+                        if err == nil {
+                            logFile.WriteString(fmt.Sprintf("[Server] %s", msg.text))
+                            logFile.Close()
+                        }
+                    }
+                }
 
-			go func(entry, file string) {
-				f, err := os.OpenFile(file, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-				if err == nil {
-					defer f.Close()
-					f.WriteString(entry)
-				}
-			}(messageText, filename)
-		}
-		mutex.Unlock()
+                //send to all clients except sender
+                for client := range clients {
+                    if client == msg.sender {
+                        continue
+                    }
+                    client.SetWriteDeadline(time.Now().Add(1 * time.Second))
+                    fmt.Fprintf(client, "[%s] %s\n", msg.name, msg.text)
+                    client.SetWriteDeadline(time.Time{})
+                }
+            }
+            
+            mutex.Unlock()
+        }
+    }()
 
-		elapsed := time.Since(start) //end timer
-		fmt.Printf("Broadcast latency: %v\n", elapsed) //log latency
-	}
+    //batch messages for processing
+    var batch []Message
+    batchTimer := time.NewTicker(100 * time.Millisecond) //adjust timing as needed
+    defer batchTimer.Stop()
+
+    for {
+        select {
+        case msg := <-broadcast:
+            batch = append(batch, msg)
+            
+            //send batch if it reaches a certain size
+            if len(batch) >= 50 { //adjust batch size as needed
+                messageBatch <- batch
+                batch = nil
+            }
+
+        case <-batchTimer.C:
+            //send whatever we have at regular intervals
+            if len(batch) > 0 {
+                messageBatch <- batch
+                batch = nil
+            }
+        }
+    }
 }
-
-
 func main() {
-	listener, err := net.Listen("tcp", ":4000")
-	if err != nil {
-		panic(err)
-	}
-	defer listener.Close()
+    //create a connection counter that allows max 10 connections
+    connectionLimit := make(chan struct{}, 10)
+    defer close(connectionLimit)
 
-	go broadcaster()
-	fmt.Println("TCP chat server started on port 4000...")
+    //start a background job to show server stats every minute
+    go func() {
+        for range time.Tick(1 * time.Minute) {
+            mutex.Lock()
+            fmt.Printf("Current connections: %d | Goroutines running: %d\n", 
+                len(clients),
+                runtime.NumGoroutine())
+            mutex.Unlock()
+        }
+    }()
 
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			continue
-		}
-		go handleConnection(conn)
-	}
+    //start listening on port 4000
+    listener, err := net.Listen("tcp", ":4000")
+    if err != nil {
+        panic(err)
+    }
+    defer listener.Close()
+
+    //start the message broadcaster
+    go broadcaster()
+    fmt.Println("Chat server is running on port 4000...")
+
+    //keep accepting new connections
+    for {
+        //reserve a connection slot (blocks if 1000 already connected)
+        connectionLimit <- struct{}{}
+        
+        //wait for new connection
+        conn, err := listener.Accept()
+        if err != nil {
+            <-connectionLimit //free slot if error occurs
+            continue
+        }
+
+        //handle the connection in a new goroutine
+        go func(c net.Conn) {
+            defer func() { <-connectionLimit }() //free slot when done
+            handleConnection(c)
+        }(conn)
+    }
 }

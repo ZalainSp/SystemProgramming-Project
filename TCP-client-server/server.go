@@ -29,11 +29,19 @@ func handleConnection(conn net.Conn) {
 	//ask for and read username
 	fmt.Fprint(conn, "Enter your name: ")
 	nameReader := bufio.NewReader(conn)
+
+	//set 30 sec disconnect for inactvity 
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	rawName, err := nameReader.ReadString('\n')
 	if err != nil {
 		return
 	}
+	conn.SetReadDeadline(time.Time{}) //clear the timer after successful read
+
 	username := strings.TrimSpace(rawName)
+	if username == "" {
+		username = "Anonymous"
+	}
 
 	//get the current login time
 	loginTime := time.Now().Format("15:04:05")
@@ -50,33 +58,57 @@ func handleConnection(conn net.Conn) {
 		text:   fmt.Sprintf("%s has joined the chat at %s\n", username, loginTime),
 		sender: nil,
 	}
-
+	inactive := false 
 	//read loop
 	reader := bufio.NewReader(conn)
 	for {
+		//reset deadline on each loop
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second)) 
 		msg, err := reader.ReadString('\n')
 		if err != nil {
+			//inactivity timeout or connection error
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				fmt.Printf("%s has been disconnected due to inactivity\n", username)
+				broadcast <- Message{
+					name:   "Server",
+					text:   fmt.Sprintf("%s has been disconnected due to inactivity.\n", username),
+					sender: nil,
+				}
+				inactive = true
+			}
 			break
 		}
+		msg = strings.TrimSpace(msg)
+		if msg == "" {
+			continue // Skip empty messages
+		}
+		
+		conn.SetReadDeadline(time.Time{}) //clear deadline after read
 		broadcast <- Message{
 			name:   username,
 			text:   msg,
 			sender: conn,
 		}
 	}
-	//get current disconnect time
-	disconnectTime := time.Now().Format("15:04:05")
+		if !inactive {
+		//get current disconnect time
+		disconnectTime := time.Now().Format("15:04:05")
+		mutex.Lock()
+		delete(clients, conn)
+		delete(names, conn)
+		mutex.Unlock()
 
-	//client disconnects
-	mutex.Lock()
-	delete(clients, conn)
-	delete(names, conn)
-	mutex.Unlock()
-
-	broadcast <- Message{
-		name:   "Server",
-		text:   fmt.Sprintf("%s has left the chat at %s\n", username, disconnectTime),
-		sender: nil,
+		broadcast <- Message{
+			name:   "Server",
+			text:   fmt.Sprintf("%s has left the chat at %s\n", username, disconnectTime),
+			sender: nil,
+		}
+	} else {
+		//client disconnects
+		mutex.Lock()
+		delete(clients, conn)
+		delete(names, conn)
+		mutex.Unlock()
 	}
 }
 

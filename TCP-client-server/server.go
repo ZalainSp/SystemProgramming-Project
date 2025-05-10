@@ -79,6 +79,12 @@ func handleConnection(conn net.Conn) {
 			break
 		}
 		msg = strings.TrimSpace(msg)
+
+		if len(msg) > 100 {
+    	msg = msg[:100] // truncate
+    	fmt.Fprintln(conn, "[Server] Your message was too long and has been truncated to 100 characters.")
+}
+
 		if msg == "" {
 			continue // Skip empty messages
 		}

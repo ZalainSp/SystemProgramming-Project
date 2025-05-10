@@ -86,7 +86,29 @@ func handleConnection(conn net.Conn) {
 }
 
 		if msg == "" {
-			continue // Skip empty messages
+			continue //skip empty messages
+		}
+		if strings.HasPrefix(msg, "/") {
+			switch msg {
+			case "/quit":
+				fmt.Fprintln(conn, "[Server] Goodbye!")
+				//get current disconnect time
+				disconnectTime := time.Now().Format("15:04:05")
+				mutex.Lock()
+				delete(clients, conn)
+				delete(names, conn)
+				mutex.Unlock()
+
+				broadcast <- Message{
+					name:   "Server",
+					text:   fmt.Sprintf("%s has left the chat at %s\n", username, disconnectTime),
+					sender: nil,
+				}
+				return //close the connection
+			default:
+				fmt.Fprintf(conn, "[Server] Unknown command: %s\n", msg)
+			}
+			continue //skip broadcasting commands
 		}
 		
 		conn.SetReadDeadline(time.Time{}) //clear deadline after read

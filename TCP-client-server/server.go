@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 	"runtime"
+	"flag"
 )
 
 type Message struct {
@@ -23,6 +24,19 @@ var (
 	mutex     sync.Mutex
 	broadcast = make(chan Message)
 )
+
+//metrics struct to track server performance
+type Metrics struct {
+	mu             sync.Mutex
+	messageCount   int64
+	totalLatency   time.Duration
+	startTime      time.Time
+	droppedPackets int64
+}
+
+var metrics = Metrics{
+	startTime: time.Now(),
+}
 
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
@@ -153,6 +167,7 @@ func broadcaster() {
     //start a worker to handle batch sending
     go func() {
         for batch := range messageBatch {
+			start := time.Now()
             mutex.Lock()
             
             //process all messages in the batch
@@ -186,7 +201,10 @@ func broadcaster() {
                     client.SetWriteDeadline(time.Time{})
                 }
             }
-            
+            metrics.mu.Lock()
+			metrics.messageCount += int64(len(batch))
+			metrics.totalLatency += time.Since(start)
+			metrics.mu.Unlock()
             mutex.Unlock()
         }
     }()
@@ -217,23 +235,42 @@ func broadcaster() {
     }
 }
 func main() {
+	port := flag.String("port", "4000", "Port number for the chat server")
+	maxConn := flag.Int("max", 10, "Maximum concurrent connections")
+	flag.Parse()
+
     //create a connection counter that allows max 10 connections
-    connectionLimit := make(chan struct{}, 10)
+    connectionLimit := make(chan struct{}, *maxConn)
     defer close(connectionLimit)
 
     //start a background job to show server stats every minute
     go func() {
-        for range time.Tick(1 * time.Minute) {
-            mutex.Lock()
-            fmt.Printf("Current connections: %d | Goroutines running: %d\n", 
-                len(clients),
-                runtime.NumGoroutine())
-            mutex.Unlock()
-        }
-    }()
+        for range time.Tick(30 * time.Second) {
+			metrics.mu.Lock()
+			duration := time.Since(metrics.startTime).Seconds()
+			throughput := float64(metrics.messageCount) / duration
+			avgLatency := metrics.totalLatency.Seconds() / float64(metrics.messageCount) * 1000
+			lossRate := float64(metrics.droppedPackets) / float64(metrics.droppedPackets+metrics.messageCount) * 100
+
+			mutex.Lock()
+			fmt.Printf("\n[Metrics] Connections: %d | Latency: %.2fms | Loss: %.2f%% | Throughput: %.2f msg/s | Goroutines: %d\n",
+				len(clients),
+				avgLatency,
+				lossRate,
+				throughput,
+				runtime.NumGoroutine())
+			mutex.Unlock()
+
+			metrics.messageCount = 0
+			metrics.totalLatency = 0
+			metrics.droppedPackets = 0
+			metrics.startTime = time.Now()
+			metrics.mu.Unlock()
+		}
+	}()
 
     //start listening on port 4000
-    listener, err := net.Listen("tcp", ":4000")
+    listener, err := net.Listen("tcp", ":"+*port)
     if err != nil {
         panic(err)
     }
@@ -241,7 +278,7 @@ func main() {
 
     //start the message broadcaster
     go broadcaster()
-    fmt.Println("Chat server is running on port 4000...")
+    fmt.Printf("Chat server running on port %s (max %d connections)\n", *port, *maxConn)
 
     //keep accepting new connections
     for {

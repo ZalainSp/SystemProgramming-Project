@@ -304,10 +304,15 @@ func (s *server) logMetrics(){
 
 		s.clientsMutex.RLock()
 		activeClients := len(s.clients)
+		var totalLostPacketsAggregated uint64
+		for _, cl := range s.clients{
+			totalLostPacketsAggregated += cl.lostPackets
+		}
+
 		s.clientsMutex.RUnlock()
 
-		log.Printf("Metrics: ActiveClients: %d, MsgsTotal: %d, BytesTotal: %d, MsgRate: %.2f/s, ByteRate: %.2f KB/s",
-			activeClients, currentMessages, currentBytes, msgRate, byteRate/1024.0)
+		log.Printf("Metrics: ActiveClients: %d, MsgsTotal: %d, BytesTotal: %d, MsgRate: %.2f/s, ByteRate: %.2f KB/s, TotalLostPkts(SrvView): %d",
+			activeClients, currentMessages, currentBytes, msgRate, byteRate/1024.0, totalLostPacketsAggregated)
 
 		lastMessages = currentMessages
 		lastBytes = currentBytes

@@ -26,7 +26,7 @@ This project implements a real-time chat application using both TCP and UDP prot
 ## How to Run
 ### TCP Chat
 1. Start server: `go run server.go -port 4000 -max 10`
-2. Connect clients: `go run client.go`
+2. Connect clients: `nc localhost 4000`
 
 ### UDP Chat
 1. Start server: `go run uServer.go`

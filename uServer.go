@@ -1,4 +1,4 @@
-//Writer: Jeronimo Tzib
+//writer: Jeronimo Tzib
 
 package main
 
@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,29 +22,32 @@ const (
 
 //client represents a connected client with last activity timestamp
 type client struct{
+
 	addr       *net.UDPAddr //network address of client
 	lastActive time.Time    //last message received time for timeout detection
+	lastSeenSeqNum	uint64 //last sequence number received from this client
+	expectedNextSeqNum uint64 //next sequence number expected (lastSeen + 1)
+	lostPackets uint64 //count of inferred lost packets from this client
+	firstMessageReceived bool //to handle the very first message's sequence number
 }
 
 //server maintains shared state for the UDP chat server
 type server struct{
 	conn *net.UDPConn //UDP network connection
 
-	clients      map[string]*client //map of connected clients (key: addr.String())
-	clientsMutex sync.RWMutex       //mutex for concurrent access to clients map
+	clients      map[string]*client //map of connected clients
+	clientsMutex sync.RWMutex //mutex for concurrent access to clients map
 
 	// Metrics
 	receivedMessagesTotal uint64
 	receivedBytesTotal    uint64
 	metricsMutex          sync.Mutex //to protect aggregated metrics for reading by logMetrics
 
-	// Per-client packet loss tracking (optional, more advanced)
-	// clientLastSeq last sequence number seen
-	// clientLostPackets count of inferred lost packets
 }
 
 //NewServer creates and initializes a new UDP server instance
-func NewServer(addr string) (*server, error) {
+func NewServer(addr string) (*server, error){
+	
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("resolving UDP address: %w", err)
@@ -89,41 +93,125 @@ func (s *server) handleMessages(){
 			continue
 		}
 
-		//update server metrics(atomically, though handleMessages is single-threaded for reads)
+		//update server metrics(atomically, though handleMessages is single threaded for reads)
 		atomic.AddUint64(&s.receivedMessagesTotal, 1)
 		atomic.AddUint64(&s.receivedBytesTotal, uint64(n))
 
 		msgString := string(buffer[:n])
+		clientKey := addr.String() //get client key for map access
 
-		//optional: parse message for server-side analysis (e.g., client-to-server latency, seq num tracking)
-		parts := strings.SplitN(msgString, "|", 3)
-		if len(parts) == 3{
-			
-			//basic per-client sequence tracking (example, could be expanded)
-			//s.clientsMutex.Lock() // Need to protect clientLastSeq if used
-			
+		//packet loss logic
+		s.clientsMutex.Lock() //full lock needed to read and potentially write to client struct
+
+		c, exists := s.clients[clientKey]
+		if !exists{
+            //client is new, will be fully initialized in updateClient
+            //for now, just release lock and proceed to updateClient
+            //updateClient will create the client entry
+            //packet loss tracking will effectively start from the *next* message
 
 		} else{
-			log.Printf("SrvRcv: Malformed message from %s: %s", addr.String(), msgString)
-		}
 
-		s.updateClient(addr) //update or add client
-		s.broadcast(msgString, addr) //send to all other clients
+			parts := strings.SplitN(msgString, "|", 3)
+
+			if len(parts) >= 1 { //we need at least the sequence number part
+				seqNumStr := parts[0]
+				currentSeqNum, parseErr := strconv.ParseUint(seqNumStr, 10, 64)
+
+				if parseErr == nil{
+					if !c.firstMessageReceived{
+
+						//this is the first message we're processing for sequence tracking for this client
+						c.firstMessageReceived = true
+						c.lastSeenSeqNum = currentSeqNum
+						c.expectedNextSeqNum = currentSeqNum + 1
+						
+					} else{
+						if currentSeqNum == c.expectedNextSeqNum{
+
+							//packet arrived as expected
+							c.lastSeenSeqNum = currentSeqNum
+							c.expectedNextSeqNum = currentSeqNum + 1
+
+						} else if currentSeqNum > c.expectedNextSeqNum{
+
+							//gap detected, packets were lost
+							lostCount := currentSeqNum - c.expectedNextSeqNum
+							c.lostPackets += lostCount
+							log.Printf("PKTLOSS [%s]: Gap detected! Expected seq %d, got %d. Lost %d packet(s). Total lost: %d",
+								clientKey, c.expectedNextSeqNum, currentSeqNum, lostCount, c.lostPackets)
+							c.lastSeenSeqNum = currentSeqNum
+							c.expectedNextSeqNum = currentSeqNum + 1
+						} else{
+
+							//currentSeqNum < c.expectedNextSeqNum: Duplicate or out-of-order packet
+							//for simplicity, UDP often just logs this and moves on, or ignores old packets
+							//we won't count it as "new" loss, but we update lastSeen if it's newer than what we have
+
+                            if currentSeqNum > c.lastSeenSeqNum{ //if it's an out-of-order but newer packet
+                                c.lastSeenSeqNum = currentSeqNum
+                                //we don't change expectedNextSeqNum based on an out-of-order older packet.
+                            }
+							log.Printf("PKTLOSS [%s]: Out-of-order/duplicate. Expected %d, got %d. Last seen: %d",
+								clientKey, c.expectedNextSeqNum, currentSeqNum, c.lastSeenSeqNum)
+						}
+					}
+				} else{
+					log.Printf("PKTLOSS [%s]: Could not parse sequence number from message: %s", clientKey, msgString)
+				}
+			} else{
+				log.Printf("PKTLOSS [%s]: Message too short for sequence number: %s", clientKey, msgString)
+			}
+		}
+		s.clientsMutex.Unlock() //unlock after accessing/modifying client struct
+
+
+		s.updateClient(addr, msgString) //pass msgString to parse seq num for new clients
+		s.broadcast(msgString, addr)
 	}
 }
 
 //updateClient adds/updates a client in the connection pool
-func (s *server) updateClient(addr *net.UDPAddr){
+func (s *server) updateClient(addr *net.UDPAddr,msgString string){
 
 	s.clientsMutex.Lock()
 	defer s.clientsMutex.Unlock()
 
 	key := addr.String()
-	if _, exists := s.clients[key]; !exists{
+	now := time.Now()
+
+	if c, exists := s.clients[key]; !exists{
+
 		log.Printf("New client: %s", key)
-		s.clients[key] = &client{addr: addr, lastActive: time.Now()}
+
+		newClient := &client{
+
+			addr: addr,
+			lastActive: now,
+
+			//initialize packet loss tracking fields
+			firstMessageReceived: false, //will be set true on first processed message in handleMessages
+			//or, try to parse sequence from this very first message
+		}
+
+		//attempt to set initial sequence from the first message
+		parts := strings.SplitN(msgString, "|", 3)
+		if len(parts) >= 1{
+
+			seqNumStr := parts[0]
+			initialSeqNum, parseErr := strconv.ParseUint(seqNumStr, 10, 64)
+			if parseErr == nil{
+
+				newClient.lastSeenSeqNum = initialSeqNum
+				newClient.expectedNextSeqNum = initialSeqNum + 1
+				newClient.firstMessageReceived = true //since we processed its first seq num here
+				log.Printf("PKTLOSS [%s]: New client, first message seq %d. Expecting %d.", key, initialSeqNum, newClient.expectedNextSeqNum)
+			}
+		}
+		s.clients[key] = newClient
+
 	} else{
-		s.clients[key].lastActive = time.Now()
+		c.lastActive = now //update existing client's activity time
 	}
 }
 
@@ -174,11 +262,11 @@ func (s *server) cleanupInactiveClients(){
 	for range ticker.C{
 
 		s.clientsMutex.Lock()
-
 		now := time.Now()
+
 		for key, c := range s.clients {
-			if now.Sub(c.lastActive) > clientTimeout {
-				log.Printf("Client %s timed out. Removing.", key)
+			if now.Sub(c.lastActive) > clientTimeout{
+				log.Printf("Client %s timed out. Removing. Total inferred lost packets from this client: %d", key, c.lostPackets) //log lost packets on timeout
 				delete(s.clients, key)
 			}
 		}
@@ -248,7 +336,6 @@ func main(){
 	}
 	srv.Start()
 
-	// Keep main goroutine alive.
-	// In a real app, you'd handle signals for graceful shutdown
+	//keep main goroutine alive.
 	select {}
 }

@@ -19,7 +19,7 @@ This project implements a real-time chat application using both TCP and UDP prot
 - Prepare for real-world application development
 
 ## Project Deliverables
-- [YouTube Video Demo](#) ()
+- [YouTube Video Demo](#) (https://youtu.be/rDf2_i4mqW8)
 - [Google Slides Presentation](#) (https://docs.google.com/presentation/d/1tBv7Bb-GAy-8fA7bNQn9ShiAMtranu3nsKiRO1wBOAI/edit?usp=sharing)
 
 
